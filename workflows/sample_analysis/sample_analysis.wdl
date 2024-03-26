@@ -4,11 +4,16 @@ version 1.0
 
 import "../humanwgs_structs.wdl"
 import "../wdl-common/wdl/tasks/pbsv_discover.wdl" as PbsvDiscover
-import "../wdl-common/wdl/workflows/deepvariant/deepvariant.wdl" as DeepVariant
-import "../wdl-common/wdl/tasks/mosdepth.wdl" as Mosdepth
 import "../wdl-common/wdl/tasks/pbsv_call.wdl" as PbsvCall
+import "../wdl-common/wdl/tasks/samtools_merge.wdl" as SamtoolsMerge
+import "../wdl-common/wdl/workflows/deepvariant/deepvariant.wdl" as DeepVariant
+import "../wdl-common/wdl/tasks/trgt.wdl" as Trgt
+import "../wdl-common/wdl/tasks/mosdepth.wdl" as Mosdepth
 import "../wdl-common/wdl/tasks/concat_vcf.wdl" as ConcatVcf
+import "../wdl-common/wdl/tasks/paraphase.wdl" as Paraphase
+import "../wdl-common/wdl/tasks/hificnv.wdl" as Hificnv
 import "../wdl-common/wdl/workflows/hiphase/hiphase.wdl" as HiPhase
+import "../wdl-common/wdl/tasks/cpg_pileup.wdl" as CpgPileup
 
 workflow sample_analysis {
 	input {
@@ -79,7 +84,7 @@ workflow sample_analysis {
 		scatter (bam_object in aligned_bam) {
 			File bam_to_merge = bam_object.data
 		}
-		call merge_bams {
+		call SamtoolsMerge.merge_bams {
 			input:
 				bams = bam_to_merge,
 				output_bam_name = "~{sample.sample_id}.~{reference.name}.bam",
@@ -117,7 +122,7 @@ workflow sample_analysis {
 			runtime_attributes = default_runtime_attributes
 	}
 
-	call trgt {
+	call Trgt.trgt {
 		input:
 			sample_id = sample.sample_id,
 			sex = sample.sex,
@@ -152,16 +157,7 @@ workflow sample_analysis {
 		"data_index": hiphase.haplotagged_bams[0].data_index
 	}
 
-	call coverage_dropouts {
-		input:
-			bam = haplotagged_bam.data,
-			bam_index = haplotagged_bam.data_index,
-			tandem_repeat_bed = reference.trgt_tandem_repeat_bed,
-			output_prefix = "~{sample.sample_id}.~{reference.name}",
-			runtime_attributes = default_runtime_attributes
-	}
-
-	call cpg_pileup {
+	call CpgPileup.cpg_pileup {
 		input:
 			bam = haplotagged_bam.data,
 			bam_index = haplotagged_bam.data_index,
@@ -171,7 +167,7 @@ workflow sample_analysis {
 			runtime_attributes = default_runtime_attributes
 	}
 
-	call paraphase {
+	call Paraphase.paraphase {
 		input:
 			sample_id = sample.sample_id,
 			bam = haplotagged_bam.data,
@@ -182,7 +178,7 @@ workflow sample_analysis {
 			runtime_attributes = default_runtime_attributes
 	}
 
-	call hificnv {
+	call Hificnv.hificnv {
 		input:
 			sample_id = sample.sample_id,
 			sex = sample.sex,
@@ -231,7 +227,6 @@ workflow sample_analysis {
 		# per sample trgt outputs
 		IndexData trgt_repeat_vcf = hiphase.phased_vcfs[2]
 		IndexData trgt_spanning_reads = {"data": trgt.spanning_reads, "data_index": trgt.spanning_reads_index}
-		File trgt_dropouts = coverage_dropouts.trgt_dropouts
 
 		# per sample cpg outputs
 		Array[File] cpg_pileup_beds = cpg_pileup.pileup_beds
@@ -389,359 +384,6 @@ task bcftools {
 		docker: "~{runtime_attributes.container_registry}/bcftools@sha256:46720a7ab5feba5be06d5269454a6282deec13060e296f0bc441749f6f26fdec"
 		cpu: threads
 		memory: "4 GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " HDD"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task merge_bams {
-	input {
-		Array[File] bams
-
-		String output_bam_name
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Int threads = 8
-	Int disk_size = ceil(size(bams, "GB") * 2 + 20)
-
-	command <<<
-		set -euo pipefail
-
-		samtools --version
-
-		samtools merge \
-			-@ ~{threads - 1} \
-			-o ~{output_bam_name} \
-			~{sep=' ' bams}
-
-		samtools index ~{output_bam_name}
-	>>>
-
-	output {
-		File merged_bam = "~{output_bam_name}"
-		File merged_bam_index = "~{output_bam_name}.bai"
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/samtools@sha256:cbe496e16773d4ad6f2eec4bd1b76ff142795d160f9dd418318f7162dcdaa685"
-		cpu: threads
-		memory: "4 GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " LOCAL"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task trgt {
-	input {
-		String sample_id
-		String? sex
-
-		File bam
-		File bam_index
-
-		File reference
-		File reference_index
-		File tandem_repeat_bed
-
-		String output_prefix
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Boolean sex_defined = defined(sex)
-	String karyotype = if select_first([sex, "FEMALE"]) == "MALE" then "XY" else "XX"
-	Int threads = 4
-	Int disk_size = ceil((size(bam, "GB") + size(reference, "GB")) * 2 + 20)
-
-	command <<<
-		set -euo pipefail
-
-		echo ~{if sex_defined then "" else "Sex is not defined for ~{sample_id}.  Defaulting to karyotype XX for TRGT."}
-
-		trgt --version
-
-		trgt \
-			--threads ~{threads} \
-			--karyotype ~{karyotype} \
-			--genome ~{reference} \
-			--repeats ~{tandem_repeat_bed} \
-			--reads ~{bam} \
-			--output-prefix ~{output_prefix}.trgt
-
-		bcftools --version
-
-		bcftools sort \
-			--output-type z \
-			--output ~{output_prefix}.trgt.sorted.vcf.gz \
-			~{output_prefix}.trgt.vcf.gz
-
-		bcftools index \
-			--threads ~{threads - 1} \
-			--tbi \
-			~{output_prefix}.trgt.sorted.vcf.gz
-		
-		samtools --version
-
-		samtools sort \
-			-@ ~{threads - 1} \
-			-o ~{output_prefix}.trgt.spanning.sorted.bam \
-			~{output_prefix}.trgt.spanning.bam
-
-		samtools index \
-			-@ ~{threads - 1} \
-			~{output_prefix}.trgt.spanning.sorted.bam
-	>>>
-
-	output {
-		File spanning_reads = "~{output_prefix}.trgt.spanning.sorted.bam"
-		File spanning_reads_index = "~{output_prefix}.trgt.spanning.sorted.bam.bai"
-		File repeat_vcf = "~{output_prefix}.trgt.sorted.vcf.gz"
-		File repeat_vcf_index = "~{output_prefix}.trgt.sorted.vcf.gz.tbi"
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/trgt@sha256:88eaa6b6c7d440a48d7f0036e46a2ce4b37cf5be8bd84921eaa69e3c11b98556"
-		cpu: threads
-		memory: "4 GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " HDD"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task coverage_dropouts {
-	input {
-		File bam
-		File bam_index
-
-		File tandem_repeat_bed
-
-		String output_prefix
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Int threads = 2
-	Int disk_size = ceil((size(bam, "GB")) * 2 + 20)
-
-	command <<<
-		set -euo pipefail
-
-		# Get coverage dropouts
-		check_trgt_coverage.py \
-			~{tandem_repeat_bed} \
-			~{bam} \
-		> ~{output_prefix}.trgt.dropouts.txt
-	>>>
-
-	output {
-		File trgt_dropouts = "~{output_prefix}.trgt.dropouts.txt"
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/trgt@sha256:88eaa6b6c7d440a48d7f0036e46a2ce4b37cf5be8bd84921eaa69e3c11b98556"
-		cpu: threads
-		memory: "4 GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " HDD"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task cpg_pileup {
-	input {
-		File bam
-		File bam_index
-
-		String output_prefix
-
-		File reference
-		File reference_index
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Int threads = 12
-	# Uses ~4 GB memory / thread
-	Int mem_gb = threads * 4
-	Int disk_size = ceil((size(bam, "GB") + size(reference, "GB")) * 2 + 20)
-
-	command <<<
-		set -euo pipefail
-
-		aligned_bam_to_cpg_scores --version
-
-		aligned_bam_to_cpg_scores \
-			--threads ~{threads} \
-			--bam ~{bam} \
-			--ref ~{reference} \
-			--output-prefix ~{output_prefix} \
-			--min-mapq 1 \
-			--min-coverage 10 \
-			--model "$PILEUP_MODEL_DIR"/pileup_calling_model.v1.tflite
-	>>>
-
-	output {
-		Array[File] pileup_beds = glob("~{output_prefix}.*.bed")
-		Array[File] pileup_bigwigs = glob("~{output_prefix}.*.bw")
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/pb-cpg-tools@sha256:b95ff1c53bb16e53b8c24f0feaf625a4663973d80862518578437f44385f509b"
-		cpu: threads
-		memory: mem_gb + " GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " HDD"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task paraphase {
-	input {
-		File bam
-		File bam_index
-
-		File reference
-		File reference_index
-
-		String sample_id
-		String out_directory
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Int threads = 8
-	Int mem_gb = 16
-	Int disk_size = ceil(size(bam, "GB") + 20)
-
-	command <<<
-		set -euo pipefail
-
-		paraphase --version
-
-		paraphase \
-			--threads ~{threads} \
-			--bam ~{bam} \
-			--reference ~{reference} \
-			--out ~{out_directory}
-
-		if ls ~{out_directory}/~{sample_id}_vcfs/*.vcf &> /dev/null; then
-			cd ~{out_directory} \
-				&& tar zcvf ~{out_directory}.tar.gz ~{sample_id}_vcfs/*.vcf \
-				&& mv ~{out_directory}.tar.gz ../
-		fi
-	>>>
-
-	output {
-		File output_json = "~{out_directory}/~{sample_id}.json"
-		File realigned_bam = "~{out_directory}/~{sample_id}_realigned_tagged.bam"
-		File realigned_bam_index = "~{out_directory}/~{sample_id}_realigned_tagged.bam.bai"
-		File? paraphase_vcfs = "~{out_directory}.tar.gz"
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/paraphase@sha256:b9852d1a43485b13c563aaddcb32bacc7f0c9088c2ca007051b9888e9fe5617d"
-		cpu: threads
-		memory: mem_gb + " GB"
-		disk: disk_size + " GB"
-		disks: "local-disk " + disk_size + " HDD"
-		preemptible: runtime_attributes.preemptible_tries
-		maxRetries: runtime_attributes.max_retries
-		awsBatchRetryAttempts: runtime_attributes.max_retries
-		queueArn: runtime_attributes.queue_arn
-		zones: runtime_attributes.zones
-	}
-}
-
-task hificnv {
-	input {
-		String sample_id
-		String? sex
-
-		File bam
-		File bam_index
-
-		File phased_vcf
-		File phased_vcf_index
-
-		File reference
-		File reference_index
-
-		File exclude_bed
-		File exclude_bed_index
-
-		File expected_bed_male
-		File expected_bed_female
-
-		String output_prefix
-
-		RuntimeAttributes runtime_attributes
-	}
-
-	Boolean sex_defined = defined(sex)
-	File expected_bed = if select_first([sex, "FEMALE"]) == "MALE" then expected_bed_male else expected_bed_female
-
-	Int threads = 8
-	# Uses ~2 GB memory / thread
-	Int mem_gb = threads * 2
-	# <1 GB for output
-	Int disk_size = ceil((size(bam, "GB") + size(reference, "GB"))+ 20)
-
-	command <<<
-		set -euo pipefail
-
-		echo ~{if sex_defined then "" else "Sex is not defined for ~{sample_id}.  Defaulting to karyotype XX for HiFiCNV."}
-
-		hificnv --version
-
-		hificnv \
-			--threads ~{threads} \
-			--bam ~{bam} \
-			--ref ~{reference} \
-			--maf ~{phased_vcf} \
-			--exclude ~{exclude_bed} \
-			--expected-cn ~{expected_bed} \
-			--output-prefix ~{output_prefix}
-
-		bcftools index --tbi ~{output_prefix}.~{sample_id}.vcf.gz
-	>>>
-
-	output {
-		File cnv_vcf = "~{output_prefix}.~{sample_id}.vcf.gz"
-		File cnv_vcf_index = "~{output_prefix}.~{sample_id}.vcf.gz.tbi"
-		File copynum_bedgraph = "~{output_prefix}.~{sample_id}.copynum.bedgraph"
-		File depth_bw = "~{output_prefix}.~{sample_id}.depth.bw"
-		File maf_bw = "~{output_prefix}.~{sample_id}.maf.bw"
-	}
-
-	runtime {
-		docker: "~{runtime_attributes.container_registry}/hificnv@sha256:19fdde99ad2454598ff7d82f27209e96184d9a6bb92dc0485cc7dbe87739b3c2"
-		cpu: threads
-		memory: mem_gb + " GB"
 		disk: disk_size + " GB"
 		disks: "local-disk " + disk_size + " HDD"
 		preemptible: runtime_attributes.preemptible_tries
